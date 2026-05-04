@@ -96,4 +96,10 @@ The output CSV contains:
 
 ### Explanation
 
+The more details explanations are in :
+
 -`explanation.md`
+
+A comparison visualisation between the two analysis is in :
+
+-`spark-history`
