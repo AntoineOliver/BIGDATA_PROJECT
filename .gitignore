@@ -1,0 +1,20 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+
+# AWS and local secrets
+src/main/resources/aws_credentials.txt
+aws/credentials
+aws/keys/
+*.pem
+*.ppk
+/reddit-comments-text.zip
+/datasets/comments_text.csv
+*.Zone.Identifier
+
+# IDE and local runtime artifacts
+.idea/
+output/
+spark-history/

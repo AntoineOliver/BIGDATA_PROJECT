@@ -1,0 +1,32 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head><style >html { background-color: #ffffff; }</style></head>
+<body class="">
+  <script type="text/javascript">
+    (function() {
+        var redirectUrl = function getHashArgsRedirectUrl(location, hashArgsQueryParam, oauthStartQueryParam, oauthFlowStartTime) {
+  const hashArgs = "#" + (location.href.split("#")[1] || "");
+  const redirectUrl = new URL(location.href);
+  redirectUrl.pathname = location.pathname.replace(/\\/g, "/").replace(/\/\/+/g, "/");
+  redirectUrl.hash = "";
+  redirectUrl.searchParams.append(hashArgsQueryParam, hashArgs);
+  if (oauthFlowStartTime && oauthStartQueryParam) {
+    redirectUrl.searchParams.append(
+      oauthStartQueryParam,
+      oauthFlowStartTime.toString()
+    );
+  }
+  return redirectUrl;
+};
+        window.location.replace(redirectUrl(window.location, "hashArgs", "oauthStart", 1777916528243).toString());
+    })();
+  </script>
+  <noscript>
+    <div style="width: 22em; position: absolute; left: 50%; margin-left: -11em; color: red; background-color: white; border: 1px solid red; padding: 1em; font-family: sans-serif">
+      Your web browser must have JavaScript enabled
+      in order for this application to display correctly.
+    </div>
+  </noscript>
+</body>
+</html>
