@@ -3,7 +3,7 @@
 ## Project overview
 
 This project analyzes a large textual Reddit dataset with Apache Spark and compares two Scala implementations of the same analytical job:
-- a non-optimized version
+- a naive version
 - an optimized version
 
 The goal is to compute, for each `(year, subreddit)`, the top `N` most frequent words together with:
@@ -29,41 +29,58 @@ Current full dataset used by the project:
 - `datasets/comments_text.csv`
 - size: about `8.53 GB`
 
-## Main analytical job
+### Main job pipeline
 
-The main job reads Reddit comments and produces the top words per `(year, subreddit)`.
+The job performs:
 
-Main processing steps:
-1. read the CSV dataset
-2. filter invalid comments
-3. normalize the text
-4. split the text into tokens
-5. aggregate occurrences by `(year, subreddit, word)`
-6. aggregate total tokens by `(year, subreddit)`
-7. aggregate comment count and average score by `(year, subreddit)`
-8. join the aggregated results
-9. rank words with a window function
-10. keep the top `N` words for each `(year, subreddit)`
+- Load CSV from S3 or local
+- Filter invalid comments
+- Tokenize text
+- Compute:
+   - word counts (year, subreddit, word)
+   - token totals (year, subreddit)
+   - comment stats (year, subreddit)
+- Join all aggregations
+- Rank words per group
+- Write final CSV to S3
 
-### Shuffles
+#### Spark execution characteristics
 
-The job includes multiple shuffle-inducing operations:
-- aggregation by `(year, subreddit, word)`
-- aggregation by `(year, subreddit)` for token totals
-- aggregation by `(year, subreddit)` for comment statistics
-- joins between the aggregated datasets
-- ordering/windowing for top `N`
+The job contains multiple shuffles, due to:
+
+- groupByKey / reduceByKey
+- joins between aggregated datasets
+- ranking per (year, subreddit)
+- repartitioning in optimized version
+
 
 ## Implemented versions
 
-### Non-optimized version
-- entrypoint: `job.FirstAnalysis`
-- behavior: rescans the source dataset for each analytical branch
+### Naive version
+- Entry point: `job.FirstAnalysis`
+- Logic:
+  - reloads dataset multiple times
+  - recomputes independent branches
+  - no reuse of intermediate RDDs
+
+- Problems:
+  - multiple full scans of dataset
+  - duplicated computation
+  - higher shuffle volume
 
 ### Optimized version
 - entrypoint: `job.SecondAnalysis`
-- behavior: reuses normalized intermediate data, reduces redundant work, and is better suited for the remote full-data execution
+- Improvements:
+  - single normalized RDD
+  - repartition(200)
+  - persist(MEMORY_AND_DISK)
+  - reuse of intermediate data
 
+- Benefits:
+  - fewer full scans
+  - reduced shuffle pressure
+  - faster execution
+  
 ### Output comparison
 - entrypoint: `job.CompareOutputs`
 
@@ -99,7 +116,3 @@ The output CSV contains:
 The more details explanations are in :
 
 -`explanation.md`
-
-A comparison visualisation between the two analysis is in :
-
--`analyse_history/spark_comparison_visualisation`

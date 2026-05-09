@@ -1,10 +1,9 @@
 package job
 
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType, StructField, StructType}
 import utils.Commons
 
 object RedditAnalysisRunner {
@@ -24,227 +23,271 @@ object RedditAnalysisRunner {
     override val defaultOutputFolder: String = "output/reddit-analysis-optimized"
   }
 
-  private val redditSchema = StructType(
-    Seq(
-      StructField("subreddit", StringType, nullable = true),
-      StructField("subreddit_id", StringType, nullable = true),
-      StructField("author", StringType, nullable = true),
-      StructField("body", StringType, nullable = true),
-      StructField("controversiality", IntegerType, nullable = true),
-      StructField("score", DoubleType, nullable = true),
-      StructField("ups", DoubleType, nullable = true),
-      StructField("year", IntegerType, nullable = true)
-    )
-  )
+  case class Comment(
+                      year: Int,
+                      subreddit: String,
+                      score: Double,
+                      tokens: Array[String]
+                    )
 
-  private val pushshiftSchema = StructType(
-    Seq(
-      StructField("subreddit", StringType, nullable = true),
-      StructField("body", StringType, nullable = true),
-      StructField("score", DoubleType, nullable = true),
-      StructField("created_utc", LongType, nullable = true)
-    )
-  )
+  case class ResultRow(
+                        year: Int,
+                        subreddit: String,
+                        comments: Long,
+                        avg_score: Double,
+                        word: String,
+                        occurrences: Long,
+                        total_tokens: Long,
+                        relative_frequency: Double,
+                        rank: Int
+                      )
 
-  private val stopwords = Seq(
-    "the", "a", "an", "and", "or", "but", "if", "in", "on", "with", "as", "at", "by", "for", "to", "from", "of",
-    "is", "are", "was", "were", "be", "been", "have", "has", "had",
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
-    "this", "that", "these", "those", "there", "here",
-    "what", "when", "where", "why", "how",
-    "can", "will", "just", "like", "does", "did", "into", "than", "then",
-    "about", "your", "their", "because", "which", "while", "where", "whose",
-    "more", "most", "some", "such", "other", "much", "many", "only", "very",
-    "really", "still", "also", "well", "make", "made", "need", "want", "know",
-    "think", "people", "comment", "comments", "post", "reddit", "thread",
-    "deleted", "removed", "would", "could", "should", "being", "going", "okay",
-    "yeah", "haha", "http", "https"
+  private val stopwords = Set(
+    "the","a","an","and","or","but","if","in","on","with","as","at","by","for","to","from","of",
+    "is","are","was","were","be","been","have","has","had",
+    "i","you","he","she","it","we","they",
+    "this","that","these","those",
+    "what","when","where","why","how",
+    "can","will","just","like","does","did",
+    "about","your","their","because",
+    "more","most","some","other",
+    "really","still","also","well",
+    "deleted","removed","http","https"
   )
-
-  private val stopwordsArraySql = stopwords.map(word => s"'$word'").mkString(", ")
-  private val normalizedBodySql =
-    "trim(regexp_replace(lower(regexp_replace(body, 'http\\\\S+', ' ')), '[^a-z\\\\s]', ' '))"
-  private val tokenSql =
-    s"filter(split($normalizedBodySql, '\\\\s+'), token -> length(token) > 4 AND NOT array_contains(array($stopwordsArraySql), token))"
 
   def run(jobVersion: JobVersion, args: Array[String]): Unit = {
-    val runConfig = Commons.parseJobArgs(args, jobVersion.defaultOutputFolder)
-    val spark = Commons.createSparkSession(s"reddit-analysis-${jobVersion.label}", runConfig.deploymentMode)
+
+    val runConfig =
+      Commons.parseJobArgs(args, jobVersion.defaultOutputFolder)
+
+    val spark =
+      Commons.createSparkSession(
+        s"reddit-analysis-${jobVersion.label}",
+        runConfig.deploymentMode
+      )
 
     Commons.initializeSparkContext(runConfig.deploymentMode, spark)
 
-    val inputPath = Commons.resolvePath(runConfig.deploymentMode, runConfig.inputPath)
-    val outputPath = Commons.resolvePath(runConfig.deploymentMode, runConfig.outputPath)
+    val inputPath =
+      Commons.resolvePath(runConfig.deploymentMode, runConfig.inputPath)
 
-    val result =
-      if (jobVersion == Naive) buildNaivePlan(spark, inputPath, runConfig.topN)
-      else buildOptimizedPlan(spark, inputPath, runConfig.topN)
+    val outputPath =
+      Commons.resolvePath(runConfig.deploymentMode, runConfig.outputPath)
 
-    result
-      .orderBy(col("year"), col("subreddit"), col("rank"), col("word"))
+    val resultRDD =
+      if (jobVersion == Naive)
+        buildNaivePlan(spark, inputPath, runConfig.topN)
+      else
+        buildOptimizedPlan(spark, inputPath, runConfig.topN)
+
+    import spark.implicits._
+
+    resultRDD
+      .toDS()
+      .orderBy("year", "subreddit", "rank", "word")
       .coalesce(1)
       .write
       .mode("overwrite")
       .option("header", "true")
       .csv(outputPath)
 
-    println(s"Job version   : ${jobVersion.label}")
-    println(s"Deployment    : ${runConfig.deploymentMode}")
-    println(s"Input path    : $inputPath")
-    println(s"Output path   : $outputPath")
-    println(s"Top words kept: ${runConfig.topN}")
-
     spark.stop()
   }
 
-  private def loadComments(spark: SparkSession, inputPath: String): DataFrame = {
-    import spark.implicits._
+  private def tokenize(text: String): Array[String] = {
+    text
+      .toLowerCase
+      .replaceAll("http\\S+", " ")
+      .replaceAll("[^a-z\\s]", " ")
+      .split("\\s+")
+      .map(_.trim)
+      .filter(token =>
+        token.length > 4 &&
+          !stopwords.contains(token)
+      )
+  }
 
-    val lowerPath = inputPath.toLowerCase
+  private def loadComments(
+                            spark: SparkSession,
+                            inputPath: String
+                          ): RDD[Comment] = {
+
+    val df = spark.read
+      .option("header", "true")
+      .csv(inputPath)
+
+    df.rdd.flatMap { row =>
+
+      try {
+
+        val subreddit =
+          Option(row.getAs[String]("subreddit"))
+            .map(_.trim)
+            .getOrElse("")
+
+        val body =
+          Option(row.getAs[String]("body"))
+            .map(_.trim)
+            .getOrElse("")
+
+        val score =
+          Option(row.getAs[String]("score"))
+            .map(_.toDouble)
+
+        val year =
+          Option(row.getAs[String]("year"))
+            .map(_.toInt)
+
+        if (
+          subreddit.nonEmpty &&
+            body.nonEmpty &&
+            body != "[deleted]" &&
+            body != "[removed]" &&
+            score.isDefined &&
+            year.isDefined
+        ) {
+
+          val tokens = tokenize(body)
+
+          if (tokens.nonEmpty) {
+            Some(
+              Comment(
+                year.get,
+                subreddit,
+                score.get,
+                tokens
+              )
+            )
+          } else None
+
+        } else None
+
+      } catch {
+        case _: Throwable => None
+      }
+    }
+  }
+
+  private def buildNaivePlan(
+                              spark: SparkSession,
+                              inputPath: String,
+                              topN: Int
+                            ): RDD[ResultRow] = {
+
+    val commentsA = loadComments(spark, inputPath)
+    val commentsB = loadComments(spark, inputPath)
+    val commentsC = loadComments(spark, inputPath)
+
+    computeResult(
+      commentsA,
+      commentsB,
+      commentsC,
+      topN
+    )
+  }
+
+  private def buildOptimizedPlan(
+                                  spark: SparkSession,
+                                  inputPath: String,
+                                  topN: Int
+                                ): RDD[ResultRow] = {
 
     val comments =
-      if (lowerPath.endsWith(".csv")) {
-        spark.read
-          .option("header", "true")
-          .option("multiLine", "false")
-          .option("escape", "\"")
-          .schema(redditSchema)
-          .csv(inputPath)
-          .select(
-            trim($"subreddit").as("subreddit"),
-            trim($"body").as("body"),
-            $"score".cast(DoubleType).as("score"),
-            $"year".cast(IntegerType).as("year")
-          )
-      } else {
-        spark.read
-          .schema(pushshiftSchema)
-          .json(inputPath)
-          .select(
-            trim($"subreddit").as("subreddit"),
-            trim($"body").as("body"),
-            $"score".cast(DoubleType).as("score"),
-            year(from_unixtime($"created_utc".cast(LongType))).cast(IntegerType).as("year")
-          )
-      }
+      loadComments(spark, inputPath)
+        .repartition(200)
+        .persist(StorageLevel.MEMORY_AND_DISK)
 
-    comments
-      .filter($"subreddit".isNotNull && length($"subreddit") > 0)
-      .filter($"body".isNotNull && length(trim($"body")) > 0)
-      .filter(!$"body".isin("[deleted]", "[removed]"))
-      .filter($"year".isNotNull)
-      .filter($"score".isNotNull)
-  }
-
-  private def normalizedComments(source: DataFrame): DataFrame = {
-    source
-      .select(
-        col("year"),
-        col("subreddit"),
-        col("score"),
-        expr(tokenSql).as("tokens")
-      )
-      .filter(size(col("tokens")) > 0)
-  }
-
-  private def buildNaivePlan(spark: SparkSession, inputPath: String, topN: Int): DataFrame = {
-    val wordCounts = normalizedComments(loadComments(spark, inputPath))
-      .select(
-        col("year"),
-        col("subreddit"),
-        explode(col("tokens")).as("word")
-      )
-      .groupBy("year", "subreddit", "word")
-      .agg(count(lit(1)).as("occurrences"))
-
-    val tokenTotals = normalizedComments(loadComments(spark, inputPath))
-      .select(
-        col("year"),
-        col("subreddit"),
-        size(col("tokens")).as("token_count")
-      )
-      .groupBy("year", "subreddit")
-      .agg(sum(col("token_count")).cast("long").as("total_tokens"))
-
-    val commentStats = normalizedComments(loadComments(spark, inputPath))
-      .select(
-        col("year"),
-        col("subreddit"),
-        col("score")
-      )
-      .groupBy("year", "subreddit")
-      .agg(
-        count(lit(1)).as("comments"),
-        avg(col("score")).as("avg_score")
+    val result =
+      computeResult(
+        comments,
+        comments,
+        comments,
+        topN
       )
 
-    finalizeResult(wordCounts, tokenTotals, commentStats, topN)
-  }
-
-  private def buildOptimizedPlan(spark: SparkSession, inputPath: String, topN: Int): DataFrame = {
-    val normalized = normalizedComments(loadComments(spark, inputPath))
-      .repartition(col("year"))
-      .persist(StorageLevel.MEMORY_AND_DISK)
-
-    val tokenized = normalized
-      .select(
-        col("year"),
-        col("subreddit"),
-        col("score"),
-        explode(col("tokens")).as("word")
-      )
-      .persist(StorageLevel.MEMORY_AND_DISK)
-
-    val commentStats = normalized
-      .groupBy("year", "subreddit")
-      .agg(
-        count(lit(1)).as("comments"),
-        avg(col("score")).as("avg_score")
-      )
-
-    val wordCounts = tokenized
-      .groupBy("year", "subreddit", "word")
-      .agg(count(lit(1)).as("occurrences"))
-
-    val tokenTotals = tokenized
-      .groupBy("year", "subreddit")
-      .agg(count(lit(1)).cast("long").as("total_tokens"))
-
-    val result = finalizeResult(wordCounts, tokenTotals, commentStats, topN)
-
-    tokenized.unpersist()
-    normalized.unpersist()
+    comments.unpersist()
 
     result
   }
 
-  private def finalizeResult(
-      wordCounts: DataFrame,
-      tokenTotals: DataFrame,
-      commentStats: DataFrame,
-      topN: Int
-  ): DataFrame = {
-    val rankingWindow = Window
-      .partitionBy(col("year"), col("subreddit"))
-      .orderBy(col("occurrences").desc, col("word").asc)
+  private def computeResult(
+                             commentsWord: RDD[Comment],
+                             commentsToken: RDD[Comment],
+                             commentsStats: RDD[Comment],
+                             topN: Int
+                           ): RDD[ResultRow] = {
 
-    wordCounts
-      .join(tokenTotals, Seq("year", "subreddit"), "inner")
-      .join(commentStats, Seq("year", "subreddit"), "inner")
-      .withColumn("relative_frequency", round(col("occurrences") / col("total_tokens"), 8))
-      .withColumn("avg_score", round(col("avg_score"), 6))
-      .withColumn("rank", row_number().over(rankingWindow))
-      .filter(col("rank") <= lit(topN))
-      .select(
-        col("year"),
-        col("subreddit"),
-        col("comments"),
-        col("avg_score"),
-        col("word"),
-        col("occurrences"),
-        col("total_tokens"),
-        col("relative_frequency"),
-        col("rank")
-      )
+    val wordCounts =
+      commentsWord
+        .flatMap { c =>
+          c.tokens.map(word =>
+            ((c.year, c.subreddit, word), 1L)
+          )
+        }
+        .reduceByKey(_ + _)
+
+    val tokenTotals =
+      commentsToken
+        .map(c =>
+          ((c.year, c.subreddit), c.tokens.length.toLong)
+        )
+        .reduceByKey(_ + _)
+
+    val commentStats =
+      commentsStats
+        .map(c =>
+          ((c.year, c.subreddit), (1L, c.score))
+        )
+        .reduceByKey {
+          case ((countA, scoreA), (countB, scoreB)) =>
+            (countA + countB, scoreA + scoreB)
+        }
+        .mapValues {
+          case (count, totalScore) =>
+            (count, totalScore / count)
+        }
+
+    val joined =
+      wordCounts
+        .map {
+          case ((year, subreddit, word), occurrences) =>
+            ((year, subreddit), (word, occurrences))
+        }
+        .join(tokenTotals)
+        .join(commentStats)
+
+    joined.flatMap {
+        case ((year, subreddit), (((word, occurrences), totalTokens), (comments, avgScore))) =>
+
+          Some(
+            (
+              (year, subreddit),
+              ResultRow(
+                year,
+                subreddit,
+                comments,
+                avgScore,
+                word,
+                occurrences,
+                totalTokens,
+                occurrences.toDouble / totalTokens.toDouble,
+                0
+              )
+            )
+          )
+      }
+      .groupByKey()
+      .flatMap {
+        case (_, rows) =>
+
+          rows.toSeq
+            .sortBy(r => (-r.occurrences, r.word))
+            .take(topN)
+            .zipWithIndex
+            .map {
+              case (r, idx) =>
+                r.copy(rank = idx + 1)
+            }
+      }
   }
 }
