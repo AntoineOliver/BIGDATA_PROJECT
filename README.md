@@ -111,8 +111,11 @@ The output CSV contains:
 - `relative_frequency`
 - `rank`
 
-### Explanation
+### More
 
-The more details explanations are in :
-
+More details explanations are in :
 -`explanation.md`
+
+The histories files are in :
+- `analyse_history/naive`
+- `analyse_history/optimized`
